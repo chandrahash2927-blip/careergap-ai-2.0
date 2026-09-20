@@ -1,4 +1,4 @@
-
+import io
 import re
 import pandas as pd
 import streamlit as st
@@ -7,40 +7,90 @@ st.set_page_config(page_title="CareerGap AI", page_icon="🚀", layout="wide")
 
 # ============ FREE LLM LAYER (optional — app works fully without it) ============
 # Free key, no credit card: https://aistudio.google.com/apikey  (Gemini free tier)
-# Alternatively use a Groq key (https://console.groq.com — also free).
-try:
-    import google.generativeai as genai
-    HAS_GENAI = True
-except Exception:
-    HAS_GENAI = False
-
+# Needs ONE of these packages in requirements.txt:
+#   google-genai        (new official SDK:  pip install google-genai)
+#   google-generativeai (older SDK:         pip install google-generativeai)
 
 def get_gemini_key():
-    if "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    return st.session_state.get("gemini_key", "")
+    """Key priority: Streamlit secrets -> sidebar text input."""
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            return str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
+    return st.session_state.get("gemini_key_input", "").strip()
+
+
+def get_llm_backend():
+    """Return (backend_name, sdk_module) or (None, None).
+    Tries the new google-genai SDK first, then the legacy google-generativeai SDK."""
+    try:
+        from google import genai  # new unified SDK
+        return "google-genai", genai
+    except ImportError:
+        pass
+    try:
+        import google.generativeai as genai  # legacy SDK
+        return "google-generativeai", genai
+    except ImportError:
+        return None, None
 
 
 def llm_career_summary(skills, top, gap, roadmap_lines):
     """Generate a 3-sentence AI career summary using the FREE Gemini API.
-    Falls back to a template if no key / library / network."""
+    Returns (text, used_llm, status_message). Falls back to a template with a
+    *visible explanation* instead of failing silently."""
     fallback = (f"You are closest to job-readiness for {top['title']} at {gap['readiness']}% readiness. "
                 f"Closing {len(gap['critical'])} critical gap(s) — {', '.join(gap['critical']) or 'none'} — is the "
                 f"highest-leverage next step, and the roadmap below sequences exactly that.")
-    key = (get_gemini_key() or "").strip()
-    if not key or not HAS_GENAI:
-        return fallback, False
+    key = get_gemini_key()
+    if not key:
+        return fallback, False, "No API key set — paste a free key in the sidebar (or set GEMINI_API_KEY in Streamlit secrets)."
+    backend, sdk = get_llm_backend()
+    if backend is None:
+        return fallback, False, "Gemini SDK not installed — add `google-genai` to requirements.txt."
+    prompt = (f"You are a career advisor. In 3 short, concrete, encouraging sentences (no fluff), advise a job seeker.\n"
+              f"Their skills: {skills}.\nTop job match: {top['title']} at {top['company']} ({top['match_score']}% match, "
+              f"{gap['readiness']}% readiness).\nCritical gaps: {gap['critical']}. Important gaps: {gap['important']}.\n"
+              f"Recommended roadmap: {roadmap_lines}\nMention the single most valuable skill to learn first.")
     try:
-        genai.configure(api_key=key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = (f"You are a career advisor. In 3 short, concrete, encouraging sentences (no fluff), advise a job seeker.\n"
-                  f"Their skills: {skills}.\nTop job match: {top['title']} at {top['company']} ({top['match_score']}% match, "
-                  f"{gap['readiness']}% readiness).\nCritical gaps: {gap['critical']}. Important gaps: {gap['important']}.\n"
-                  f"Recommended roadmap: {roadmap_lines}\nMention the single most valuable skill to learn first.")
-        resp = model.generate_content(prompt)
-        return resp.text.strip(), True
-    except Exception:
-        return fallback, False
+        if backend == "google-genai":
+            client = sdk.Client(api_key=key)
+            resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            text = (resp.text or "").strip()
+        else:
+            sdk.configure(api_key=key)
+            model = sdk.GenerativeModel("gemini-2.5-flash")
+            resp = model.generate_content(prompt)
+            text = (resp.text or "").strip()
+        if not text:
+            return fallback, False, "Gemini responded but returned empty text."
+        return text, True, f"connected via {backend}"
+    except Exception as e:
+        return fallback, False, f"Gemini API call failed: {type(e).__name__}: {e}"
+
+
+def test_llm_connection():
+    """Live ping to Gemini. Returns (ok, message)."""
+    key = get_gemini_key()
+    if not key:
+        return False, "No API key set."
+    backend, sdk = get_llm_backend()
+    if backend is None:
+        return False, "Gemini SDK not installed (add `google-genai` to requirements.txt)."
+    try:
+        if backend == "google-genai":
+            client = sdk.Client(api_key=key)
+            resp = client.models.generate_content(model="gemini-2.5-flash", contents='Reply with exactly: OK')
+            text = (resp.text or "").strip()
+        else:
+            sdk.configure(api_key=key)
+            model = sdk.GenerativeModel("gemini-2.5-flash")
+            resp = model.generate_content('Reply with exactly: OK')
+            text = (resp.text or "").strip()
+        return True, f"✓ Connected ({backend}) — Gemini replied: {text[:50]}"
+    except Exception as e:
+        return False, f"✗ {type(e).__name__}: {e}"
 
 # ================= DATA (self-contained — no /content paths) =================
 SKILL_ONTOLOGY = {
@@ -169,6 +219,47 @@ COURSES = [
     dict(course_id="C45",course_name="Wireshark Packet Analysis",provider="Udemy",skills=["Wireshark"],duration_weeks=3,cost=499,level="Beginner"),
 ]
 
+# ================= AGENT 0 — PDF DOCUMENT INTAKE (robust, multi-backend) =================
+@st.cache_data(show_spinner=False)
+def extract_pdf_text(file_bytes: bytes):
+    """Try several PDF libraries in order. Returns (text, backend) or (None, error_details).
+    Cached on the raw bytes so re-runs don't re-parse the file."""
+    attempts = []
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        if text.strip():
+            return text.strip(), "pypdf"
+        attempts.append("pypdf: 0 words extracted (scanned/image PDF?)")
+    except ImportError:
+        attempts.append("pypdf not installed")
+    except Exception as e:
+        attempts.append(f"pypdf: {type(e).__name__}: {e}")
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        if text.strip():
+            return text.strip(), "PyPDF2"
+        attempts.append("PyPDF2: 0 words extracted (scanned/image PDF?)")
+    except ImportError:
+        attempts.append("PyPDF2 not installed")
+    except Exception as e:
+        attempts.append(f"PyPDF2: {type(e).__name__}: {e}")
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            text = "\n".join((p.extract_text() or "") for p in pdf.pages)
+        if text.strip():
+            return text.strip(), "pdfplumber"
+        attempts.append("pdfplumber: 0 words extracted (scanned/image PDF?)")
+    except ImportError:
+        attempts.append("pdfplumber not installed")
+    except Exception as e:
+        attempts.append(f"pdfplumber: {type(e).__name__}: {e}")
+    return None, " | ".join(attempts)
+
 # ================= AGENT 1 — PROFILE =================
 def extract_skills(text):
     lower = text.lower()
@@ -266,20 +357,22 @@ with st.sidebar:
     free_only = st.checkbox("Show FREE courses only")
     with st.expander("🔑 Free AI narration (optional)"):
         st.caption("AI-written career summary. Free Gemini key — no credit card: aistudio.google.com/apikey")
-        st.session_state["gemini_key"] = st.text_input("Gemini API key", type="password",
-                                                       value=st.session_state.get("gemini_key", ""))
+        st.text_input("Gemini API key", type="password", key="gemini_key_input")
+        if st.button("🔌 Test API connection", use_container_width=True):
+            ok, msg = test_llm_connection()
+            (st.success if ok else st.error)(msg)
     go = st.button("🚀 Analyze", type="primary", use_container_width=True)
 
 # --- PDF text extraction (Agent 0: Document intake) ---
 if pdf_file is not None:
-    try:
-        from pypdf import PdfReader
-        pdf_text = "\n".join((page.extract_text() or "") for page in PdfReader(pdf_file).pages)
-        if pdf_text.strip():
+    pdf_text, pdf_info = extract_pdf_text(pdf_file.read())
+    if pdf_text:
+        if pdf_text not in resume_text:  # avoid duplicating text on re-runs
             resume_text = (resume_text + "\n" + pdf_text).strip()
-            st.sidebar.success(f"✓ PDF parsed — {len(pdf_text.split())} words added")
-    except Exception as e:
-        st.sidebar.error(f"PDF parse failed: {e}")
+        st.sidebar.success(f"✓ PDF parsed with {pdf_info} — {len(pdf_text.split())} words added")
+    else:
+        st.sidebar.error(f"PDF parse failed: {pdf_info}  →  Fix: add `pypdf` to requirements.txt "
+                         f"(Streamlit Cloud: create/edit requirements.txt in the repo root).")
 
 if go:
     skills = sorted(set(extract_skills(resume_text)) | set(extra_skills))
@@ -334,11 +427,11 @@ if go:
 
     with tab4:
         roadmap_lines = [f"{r['Schedule']}: {r['Skill']} → {r['Course']} ({r['Provider']}, {r['Cost']})" for r in roadmap]
-        summary, used_llm = llm_career_summary(skills, top, gap, roadmap_lines)
+        summary, used_llm, llm_status = llm_career_summary(skills, top, gap, roadmap_lines)
         if used_llm:
-            st.caption("✨ Summary generated with Gemini (free API)")
+            st.caption(f"✨ Summary generated with Gemini ({llm_status})")
         else:
-            st.caption("Deterministic template summary (add a free Gemini key in the sidebar for AI narration)")
+            st.warning(f"Template summary in use. Reason: {llm_status}")
         st.info(summary)
 
         report_md = [
