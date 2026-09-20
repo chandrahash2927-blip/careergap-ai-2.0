@@ -36,6 +36,29 @@ def get_llm_backend():
         return None, None
 
 
+
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+
+def _gemini_generate(sdk, backend, key, prompt):
+    """Try Gemini models newest->oldest; return (text, model_used)."""
+    last_err = None
+    for model in GEMINI_MODELS:
+        try:
+            if backend == "google-genai":
+                client = sdk.Client(api_key=key)
+                resp = client.models.generate_content(model=model, contents=prompt)
+                text = (resp.text or "").strip()
+            else:
+                sdk.configure(api_key=key)
+                m = sdk.GenerativeModel(model)
+                resp = m.generate_content(prompt)
+                text = (resp.text or "").strip()
+            if text:
+                return text, model
+        except Exception as e:
+            last_err = e
+    raise last_err if last_err else RuntimeError("No Gemini model responded.")
+
 def llm_career_summary(skills, top, gap, roadmap_lines):
     """Generate a 3-sentence AI career summary using the FREE Gemini API.
     Returns (text, used_llm, status_message). Falls back to a template with a
@@ -54,18 +77,8 @@ def llm_career_summary(skills, top, gap, roadmap_lines):
               f"{gap['readiness']}% readiness).\nCritical gaps: {gap['critical']}. Important gaps: {gap['important']}.\n"
               f"Recommended roadmap: {roadmap_lines}\nMention the single most valuable skill to learn first.")
     try:
-        if backend == "google-genai":
-            client = sdk.Client(api_key=key)
-            resp = client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
-            text = (resp.text or "").strip()
-        else:
-            sdk.configure(api_key=key)
-            model = sdk.GenerativeModel("gemini-2.5-flash")
-            resp = model.generate_content(prompt)
-            text = (resp.text or "").strip()
-        if not text:
-            return fallback, False, "Gemini responded but returned empty text."
-        return text, True, f"connected via {backend}"
+        text, model_used = _gemini_generate(sdk, backend, key, prompt)
+        return text, True, f"connected via {backend} ({model_used})"
     except Exception as e:
         return fallback, False, f"Gemini API call failed: {type(e).__name__}: {e}"
 
@@ -79,16 +92,8 @@ def test_llm_connection():
     if backend is None:
         return False, "Gemini SDK not installed (add `google-genai` to requirements.txt)."
     try:
-        if backend == "google-genai":
-            client = sdk.Client(api_key=key)
-            resp = client.models.generate_content(model="gemini-2.5-flash", contents='Reply with exactly: OK')
-            text = (resp.text or "").strip()
-        else:
-            sdk.configure(api_key=key)
-            model = sdk.GenerativeModel("gemini-2.5-flash")
-            resp = model.generate_content('Reply with exactly: OK')
-            text = (resp.text or "").strip()
-        return True, f"✓ Connected ({backend}) — Gemini replied: {text[:50]}"
+        text, model_used = _gemini_generate(sdk, backend, key, 'Reply with exactly: OK')
+        return True, f"✓ Connected ({backend}, {model_used}) — Gemini replied: {text[:50]}"
     except Exception as e:
         return False, f"✗ {type(e).__name__}: {e}"
 
